@@ -1,5 +1,6 @@
-// Package s3 implements ports.EvidenceReader, ports.ArtifactWriter, and
-// ports.CandidateSourceReader over AWS SDK v2 S3.
+// Package s3 implements agent-remediation's object-storage ports:
+// ports.EvidenceReader and ports.ArtifactWriter over AWS SDK v2 S3, and
+// ports.CandidateSourceReader over the objectstore.Reader role.
 package s3
 
 import (

@@ -41,6 +41,7 @@ import (
 	"github.com/carolsimone/continuo/pkg/liveness"
 	pkgmessageprocessing "github.com/carolsimone/continuo/pkg/messageprocessing"
 	pkgmetrics "github.com/carolsimone/continuo/pkg/metrics"
+	"github.com/carolsimone/continuo/pkg/objectstore"
 	pkgoutbox "github.com/carolsimone/continuo/pkg/outbox"
 	pkgredis "github.com/carolsimone/continuo/pkg/redis"
 )
@@ -206,8 +207,15 @@ func main() {
 		cfg.S3.SecretAccessKey,
 	)
 
-	bundleReader := s3.NewCandidateSourceReader(
-		cfg.S3.EndpointURL, cfg.S3.Bucket, cfg.S3.Region, cfg.S3.AccessKeyID, cfg.S3.SecretAccessKey)
+	// One object-storage client for agent-remediation's adapters, each given
+	// the role it uses. Static S3 keys when both are set; otherwise the SDK's
+	// default credential chain (IAM role, workload identity).
+	objectStore, err := objectstore.New(ctx, objectstore.ConfigFromS3(cfg.S3))
+	if err != nil {
+		logger.Error("object storage client", "error", err)
+		os.Exit(1)
+	}
+	bundleReader := s3.NewCandidateSourceReader(objectStore)
 
 	graphClient, err := grpcadapter.NewGraphClient(cfg.OrchestratorAddr)
 	if err != nil {
