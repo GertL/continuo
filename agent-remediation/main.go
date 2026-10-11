@@ -199,22 +199,18 @@ func main() {
 	})
 	metricsReg.WatchRedis(rc)
 
-	store := s3.NewS3(
-		cfg.S3.EndpointURL,
-		cfg.S3.Bucket,
-		cfg.S3.Region,
-		cfg.S3.AccessKeyID,
-		cfg.S3.SecretAccessKey,
-	)
-
 	// One object-storage client for agent-remediation's adapters, each given
-	// the role it uses. Static S3 keys when both are set; otherwise the SDK's
-	// default credential chain (IAM role, workload identity).
+	// the role it uses: the evidence reader and the candidate-source reader
+	// read through it, the artifact writer writes through it. Static S3 keys
+	// when both are set; otherwise the SDK's default credential chain (IAM
+	// role, workload identity).
 	objectStore, err := objectstore.New(ctx, objectstore.ConfigFromS3(cfg.S3))
 	if err != nil {
 		logger.Error("object storage client", "error", err)
 		os.Exit(1)
 	}
+	evidenceReader := s3.NewEvidenceReader(objectStore)
+	artifactWriter := s3.NewArtifactWriter(objectStore, cfg.S3.Bucket)
 	bundleReader := s3.NewCandidateSourceReader(objectStore)
 
 	graphClient, err := grpcadapter.NewGraphClient(cfg.OrchestratorAddr)
@@ -265,7 +261,7 @@ func main() {
 	// release-controller as a verification run that carries the full
 	// parse -> candidate-schema -> validation pipeline through to a terminal
 	// passed/failed verdict without ever promoting.
-	releaseGateway := releasehttp.NewGateway(cfg.ReleaseControllerURL, store,
+	releaseGateway := releasehttp.NewGateway(cfg.ReleaseControllerURL, evidenceReader,
 		&http.Client{Timeout: 30 * time.Second})
 
 	// The packager is resolved here rather than at first use: an image built
@@ -286,10 +282,10 @@ func main() {
 	deps := handlers.Deps{
 		NewUoW:           func() uow.UnitOfWork { return postgres.NewUnitOfWork(db, logger, cfg.ServiceRepoPaths) },
 		LLM:              cachedLLM,
-		Evidence:         store,
+		Evidence:         evidenceReader,
 		Source:           gh,
 		Sanitizer:        sanitizer.Passthrough{},
-		Artifacts:        store,
+		Artifacts:        artifactWriter,
 		Clock:            ports.SystemClock{},
 		Logger:           logger,
 		MaxAttempts:      cfg.MaxAttempts,
@@ -407,7 +403,7 @@ func main() {
 		// edits, and ServiceRepoPaths splits them by owning service.
 		Getter:           proposalRepo,
 		Sources:          gh,
-		Evidence:         store,
+		Evidence:         evidenceReader,
 		ServiceRepoPaths: cfg.ServiceRepoPaths,
 	})
 	go reconciler.Run(ctx)
