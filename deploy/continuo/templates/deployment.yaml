@@ -15,7 +15,7 @@
       "agent-remediation" (dict "name" "continuo.serviceReposConfigMapName" "checksum" "service-repos" "template" "service-repos-configmap.yaml")
       "ui" (dict "name" "continuo.cancelConfigMapName") }}
 {{- range $svc := .Values.services }}
-{{- if ($svc.enabled | default true) }}
+{{- if $svc.enabled }}
 {{- $servesMetrics := has $svc.name (include "continuo.metrics.services" $ | fromJsonArray) }}
 {{- $mounted := default (dict) (get $mountedConfigMaps $svc.name) }}
 ---
@@ -35,7 +35,7 @@ metadata:
     {{- include "continuo.labels" $ | nindent 4 }}
     app.kubernetes.io/name: {{ $svc.name }}
 spec:
-  replicas: {{ default 1 $svc.replicas }}
+  replicas: {{ dig "replicas" 1 $svc }}
   selector:
     matchLabels:
       {{- include "continuo.selectorLabels" (dict "root" $ "service" $svc.name) | nindent 6 }}
