@@ -1750,6 +1750,74 @@ describe('NodeDetailPage — objects a seed full refresh may drop', () => {
   });
 });
 
+describe('NodeDetailPage — metadata of the node the page has left', () => {
+  it.each(['success', 'failure'] as const)('ignores a late metadata %s after another node answers', async (outcome) => {
+    const old = deferred();
+    mockFetch.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/nodes/svc/schema/tbl/meta') return old.promise;
+      if (url === '/api/nodes/svc/schema/other/meta') {
+        return jsonResp({ node_type: 'dbt-model', test_count: 3, test_count_known: true });
+      }
+      return jsonResp({ tasks: [], nodes: [] });
+    });
+    renderWithLinksTo('svc.schema.other');
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledWith('/api/nodes/svc/schema/tbl/meta'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'go to svc.schema.other' }));
+    await screen.findByText('dbt-model');
+
+    if (outcome === 'success') {
+      old.resolve(await jsonResp({ node_type: 'python-csv', source_uri: 's3://fixture/old-node.csv', inactive: true }));
+    } else {
+      old.reject(new Error('old metadata unavailable'));
+    }
+    await flush();
+
+    expect(screen.getByText('dbt-model')).toBeInTheDocument();
+    expect(screen.queryByText('python-csv')).toBeNull();
+    expect(screen.queryByText(/old-node.csv/)).toBeNull();
+    fireEvent.change(screen.getByLabelText(/operation/i), { target: { value: 'test' } });
+    expect(screen.getByRole('button', { name: /test this node/i })).not.toBeDisabled();
+  });
+
+  it('clears metadata while the next node is still answering', async () => {
+    const next = deferred();
+    mockFetch.mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/api/nodes/svc/schema/tbl/meta') {
+        return jsonResp({ node_type: 'python-csv', source_uri: 's3://fixture/old-node.csv' });
+      }
+      if (url === '/api/nodes/svc/schema/other/meta') return next.promise;
+      return jsonResp({ tasks: [], nodes: [] });
+    });
+    renderWithLinksTo('svc.schema.other');
+    await screen.findByText('python-csv');
+
+    fireEvent.click(screen.getByRole('button', { name: 'go to svc.schema.other' }));
+
+    expect(screen.queryByText('python-csv')).toBeNull();
+    expect(screen.queryByText(/old-node.csv/)).toBeNull();
+    next.resolve(await jsonResp({ node_type: 'dbt-model' }));
+    await screen.findByText('dbt-model');
+  });
+
+  it('ignores metadata after navigating to a name with no table', async () => {
+    const old = deferred();
+    mockFetch.mockImplementation((input: RequestInfo | URL) =>
+      String(input).endsWith('/meta') ? old.promise : jsonResp({ tasks: [], nodes: [] }));
+    renderWithLinksTo('svc.schema');
+    await waitFor(() => expect(mockFetch).toHaveBeenCalledWith('/api/nodes/svc/schema/tbl/meta'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'go to svc.schema' }));
+    old.resolve(await jsonResp({ node_type: 'python-csv', source_uri: 's3://fixture/old-node.csv' }));
+    await flush();
+
+    expect(screen.queryByText('python-csv')).toBeNull();
+    expect(screen.queryByText(/old-node.csv/)).toBeNull();
+  });
+});
+
 describe('NodeDetailPage — dialogs of the node the page has left', () => {
   it('closes the full refresh confirmation when the page moves to another node, and posts nothing', async () => {
     mockFetch.mockImplementation(metaAndRuns('dbt-model'));
