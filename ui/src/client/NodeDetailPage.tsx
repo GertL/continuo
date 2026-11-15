@@ -147,7 +147,10 @@ export default function NodeDetailPage() {
     const myGen = ++genRef.current;
     if (!poll) setRunsKnown(false);
     fetch(`/api/nodes/${encodeURIComponent(service)}/${encodeURIComponent(schema)}/${encodeURIComponent(table)}/runs?operation=${encodeURIComponent(historyOperation)}`)
-      .then(r => r.json())
+      .then(r => {
+        if (!r.ok) throw new Error(`node history answered ${r.status}`);
+        return r.json();
+      })
       .then((data: NodeRunsResponse) => {
         if (myGen !== genRef.current) return;
         setRuns(data.tasks || []);
