@@ -12,6 +12,7 @@ import (
 	"github.com/carolsimone/continuo/agent-remediation/domain/workflow"
 	"github.com/carolsimone/continuo/agent-remediation/service/ports"
 	"github.com/carolsimone/continuo/agent-remediation/service/runner/step"
+	"github.com/carolsimone/continuo/agent-remediation/service/steps/shared"
 	"github.com/carolsimone/continuo/agent-remediation/service/steps/upstream"
 )
 
@@ -139,14 +140,32 @@ func TestPrompt_TheDraftIsOneEditOfTheAncestor(t *testing.T) {
 	}, out.Draft)
 }
 
-func TestPrompt_AnEmptyOrUnchangedAnswerIsLeftToTheChecks(t *testing.T) {
-	for name, source := range map[string]string{"empty": "", "unchanged": targetSource} {
-		t.Run(name, func(t *testing.T) {
-			out := proposeUpstream(t, failure(nil), upstreamEvidence(), &fakeModel{res: answer(source, "low")})
+// An answer the model leaves empty or unchanged, or rates low, is a draft and
+// not a decline: the pre-flight checks refuse it, so a round after the first
+// revises it, and the cluster falls back only once its rounds are spent.
+func TestUpstream_AnUnchangedAnswerIsADraftTheChecksRefuse(t *testing.T) {
+	cases := []struct {
+		name   string
+		answer ports.ProposeResult
+		check  step.Check
+		code   string
+	}{
+		{"an empty answer", answer("", "high"), shared.NewContentChanged(), "content_unchanged"},
+		{"an unchanged answer", answer(targetSource, "high"), shared.NewContentChanged(), "content_unchanged"},
+		{"a low-confidence answer", answer(fixedSource, "low"), shared.NewConfidenceNotLow(), "low_confidence"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := proposeUpstream(t, failure(nil), upstreamEvidence(), &fakeModel{res: c.answer})
 
 			require.Len(t, out.Draft.Edits, 1)
-			assert.Equal(t, source, out.Draft.Edits[0].Content)
-			assert.Equal(t, "low", out.Draft.Confidence)
+			assert.Equal(t, c.answer.ProposedSQL, out.Draft.Edits[0].Content)
+			assert.Equal(t, targetSource, out.Draft.Edits[0].Original)
+			assert.Equal(t, c.answer.Confidence, out.Draft.Confidence)
+			res, err := c.check.Check(context.Background(), step.CheckInput{Failure: failure(nil), Draft: out.Draft})
+			require.NoError(t, err)
+			require.Len(t, res.Result.Findings, 1)
+			assert.Equal(t, c.code, res.Result.Findings[0].Code)
 		})
 	}
 }
@@ -178,4 +197,63 @@ func TestPrompt_RefusesAServiceWithNoRepositoryPath(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Empty(t, model.reqs, "no model call is made for a target that cannot be edited")
+}
+
+func TestUpstream_RevisesTheLastCallWithTheFindings(t *testing.T) {
+	first, second := answer(targetSource, "high"), answer(fixedSource, "medium")
+	model := &fakeModel{res: first}
+	round1 := proposeUpstream(t, failure(nil), upstreamEvidence(), model)
+	findings := []remediation.Finding{
+		{Code: "content_unchanged", Message: "the model returned the file unchanged, which is not a fix", File: "services/up-svc/models/up.sql"},
+		{Code: "confidence_low", Message: "the model rated its own fix low"},
+	}
+
+	model.res = second
+	out, err := newPrompt().Propose(context.Background(), step.PromptInput{
+		Failure: failure(nil), Evidence: upstreamEvidence(), Round: 1,
+		Previous: &round1.Draft, PreviousRequest: &model.reqs[0], PreviousAnswer: &first, Findings: findings,
+	}, model)
+
+	require.NoError(t, err)
+	require.Len(t, model.reqs, 2, "a later round makes one model call")
+	assert.Equal(t, prompt.Revise(model.reqs[0], step.AnswerJSON(first), step.FindingLines(findings)), model.reqs[1])
+	assert.NotEqual(t, model.reqs[0], model.reqs[1])
+	again := proposeUpstream(t, failure(nil), upstreamEvidence(), &fakeModel{res: second})
+	assert.Equal(t, again.Draft, out.Draft, "the answer is read as the first round's answer is")
+}
+
+func TestPrompt_ALaterRoundWithoutThePreviousCallIsAnErrorAndCallsNoModel(t *testing.T) {
+	req, res := prompt.ProposeRequest{User: "u"}, answer(fixedSource, "high")
+	cases := map[string]step.PromptInput{
+		"no previous call":    {Round: 1},
+		"no previous request": {Round: 1, PreviousAnswer: &res},
+		"no previous answer":  {Round: 1, PreviousRequest: &req},
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			in.Failure, in.Evidence = failure(nil), upstreamEvidence()
+			model := &fakeModel{res: res}
+
+			_, err := newPrompt().Propose(context.Background(), in, model)
+
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "upstream")
+			assert.Empty(t, model.reqs)
+		})
+	}
+}
+
+func TestPrompt_TheFirstRoundIsShownTheEarlierTries(t *testing.T) {
+	tries := []remediation.TryRecord{{
+		Round: 1, Try: 1, Attempt: 1,
+		Clusters: []remediation.ClusterRecord{{Members: []string{"model.up-svc.m1"}, Outcome: "<failed: pre-flight rounds spent>"}},
+	}}
+	ev := upstreamEvidence().With(remediation.KeyPreviousTries, tries)
+	model := &fakeModel{res: answer(fixedSource, "high")}
+
+	proposeUpstream(t, failure(nil), ev, model)
+
+	require.Len(t, model.reqs, 1)
+	assert.Equal(t, step.WithPreviousTries(expectedRequest(false), ev), model.reqs[0])
+	assert.Contains(t, model.reqs[0].User, "- outcome: <failed: pre-flight rounds spent>")
 }

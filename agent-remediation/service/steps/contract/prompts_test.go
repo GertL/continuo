@@ -17,7 +17,11 @@ import (
 var (
 	upstreamChanges = []prompt.UpstreamChange{{NodeID: "model.svc.up", Depth: 1, CodeDiff: "<code>"}}
 	precedentList   = []prompt.Precedent{{ReleaseID: "old", NodeID: "n0", ErrorExcerpt: "same error"}}
-	priorAttempts   = []prompt.PriorAttempt{{Attempt: 1, VerifyError: "<still bad>", Diffs: []prompt.AttemptDiff{{Path: "svc/contracts/fx.yaml", Diff: "<-a>"}}}}
+	earlierTries    = []remediation.TryRecord{{
+		Round: 1, Try: 1, Attempt: 1,
+		Clusters: []remediation.ClusterRecord{{Members: []string{nodeID}, Edits: []remediation.EditRecord{{Path: "svc/contracts/fx.yaml", Diff: "<-a>"}}}},
+		Gate:     []remediation.Finding{{Code: "verification_failed", Message: "<still bad>"}},
+	}}
 )
 
 // promptEvidence is what the context steps leave in a cluster's evidence.
@@ -27,7 +31,7 @@ func promptEvidence() remediation.Evidence {
 		With(remediation.KeyDBTLog, remediation.Text("<runner log>")).
 		With(remediation.KeyUpstreamChanges, upstreamChanges).
 		With(remediation.KeyFailurePrecedents, precedentList).
-		With(remediation.KeyPriorAttempts, priorAttempts)
+		With(remediation.KeyPreviousTries, earlierTries)
 }
 
 // laneEvidence is the evidence the lane's pythonEvidence builds for the same
@@ -44,8 +48,13 @@ func laneEvidence(noReads bool) prompt.PythonEvidence {
 		YAMLText:        "<nodes:\n  - table: rates\n>",
 		UpstreamChanges: upstreamChanges,
 		Precedents:      precedentList,
-		PriorAttempts:   priorAttempts,
 	}
+}
+
+// withTries is req with the section on the earlier tries the prompt evidence
+// holds.
+func withTries(req prompt.ProposeRequest) prompt.ProposeRequest {
+	return step.WithPreviousTries(req, promptEvidence())
 }
 
 type promptCase struct {
@@ -64,7 +73,7 @@ func promptCases() []promptCase {
 			wantStep: "python-contract",
 			nodeType: "python-node",
 			laneResult: func(noReads bool) prompt.ProposeRequest {
-				return prompt.AssemblePythonContractFix(laneEvidence(noReads))
+				return withTries(prompt.AssemblePythonContractFix(laneEvidence(noReads)))
 			},
 		},
 		{
@@ -73,7 +82,7 @@ func promptCases() []promptCase {
 			wantStep: "python-parse",
 			nodeType: "python-node",
 			laneResult: func(noReads bool) prompt.ProposeRequest {
-				return prompt.AssemblePythonParseFix(laneEvidence(noReads))
+				return withTries(prompt.AssemblePythonParseFix(laneEvidence(noReads)))
 			},
 		},
 		{
@@ -82,7 +91,7 @@ func promptCases() []promptCase {
 			wantStep: "csv-contract",
 			nodeType: "python-csv",
 			laneResult: func(noReads bool) prompt.ProposeRequest {
-				return prompt.AssembleCsvContractFix(prompt.CsvEvidence(laneEvidence(noReads)))
+				return withTries(prompt.AssembleCsvContractFix(prompt.CsvEvidence(laneEvidence(noReads))))
 			},
 		},
 	}
@@ -115,7 +124,7 @@ func TestPrompts_MetaNamesTheStepAndWhatItReads(t *testing.T) {
 			assert.NotEmpty(t, m.Description)
 			assert.Equal(t, []remediation.EvidenceKey{
 				remediation.KeyFailure, remediation.KeyContractFile, remediation.KeyContractEntry, remediation.KeyDBTLog,
-				remediation.KeyUpstreamChanges, remediation.KeyFailurePrecedents, remediation.KeyPriorAttempts,
+				remediation.KeyUpstreamChanges, remediation.KeyFailurePrecedents,
 			}, m.Needs)
 			assert.Empty(t, m.Provides)
 		})
@@ -132,6 +141,8 @@ func TestPrompts_MakeTheLanesRequestWithOneModelCall(t *testing.T) {
 
 			require.Len(t, model.reqs, 1)
 			assert.Equal(t, tc.laneResult(false), model.reqs[0])
+			assert.Contains(t, model.reqs[0].User, "## Earlier tries at this failure\n", "the first round's request shows the earlier tries")
+			assert.Contains(t, model.reqs[0].User, "Why the gate failed: <still bad>")
 		})
 	}
 }
@@ -143,8 +154,8 @@ func TestPrompts_APythonAPINodeIsToldItDeclaresNoReadsInTheValidationPrompt(t *t
 	proposeWith(t, contract.NewPythonContract(markSanitizer{}), f, promptEvidence(), model)
 
 	require.Len(t, model.reqs, 1)
-	assert.Equal(t, prompt.AssemblePythonContractFix(laneEvidence(true)), model.reqs[0])
-	assert.NotEqual(t, prompt.AssemblePythonContractFix(laneEvidence(false)), model.reqs[0])
+	assert.Equal(t, withTries(prompt.AssemblePythonContractFix(laneEvidence(true))), model.reqs[0])
+	assert.NotEqual(t, withTries(prompt.AssemblePythonContractFix(laneEvidence(false))), model.reqs[0])
 }
 
 func TestPrompts_EvidenceOtherThanTheContractFileMayBeAbsent(t *testing.T) {
@@ -155,7 +166,7 @@ func TestPrompts_EvidenceOtherThanTheContractFileMayBeAbsent(t *testing.T) {
 			proposeWith(t, tc.build(), failure(nil), contractFileEvidence(), model)
 
 			ev := laneEvidence(false)
-			ev.RunnerLog, ev.ContractEntry, ev.UpstreamChanges, ev.Precedents, ev.PriorAttempts = "", "", nil, nil, nil
+			ev.RunnerLog, ev.ContractEntry, ev.UpstreamChanges, ev.Precedents = "", "", nil, nil
 			want := map[string]prompt.ProposeRequest{
 				"python-contract": prompt.AssemblePythonContractFix(ev),
 				"python-parse":    prompt.AssemblePythonParseFix(ev),
@@ -231,5 +242,73 @@ func TestPrompts_NeedTheContractFileAndReturnTheModelError(t *testing.T) {
 			require.ErrorIs(t, err, errBoom)
 			assert.EqualError(t, err, "llm propose: boom")
 		})
+	}
+}
+
+// revisesTheLastCall runs the step's first round, then a second round that
+// carries the first one's draft, last call and findings. It asserts the second
+// round makes one model call, the revision of the first round's request with
+// its answer and the findings, and that the draft it returns is the one the
+// first round builds from the same answer.
+func revisesTheLastCall(t *testing.T, tc promptCase) {
+	t.Helper()
+	f := failure(func(f *remediation.Failure) { f.Target.NodeType = tc.nodeType })
+	first := answer(ports.ProposedFile{Path: "svc/contracts/fx.yaml", Content: "first try"})
+	second := answer(
+		ports.ProposedFile{Path: "svc/contracts/fx.yaml", Content: "second try"},
+		ports.ProposedFile{Path: "svc/contracts/shared.yaml", Content: "second shared"},
+	)
+	m := answers(first, second)
+	round1 := proposeWith(t, tc.build(), f, promptEvidence(), m)
+	findings := []remediation.Finding{
+		{Code: "contract_rejected", Message: "the packager refused the contract: column amount is not declared", File: "svc/contracts/fx.yaml"},
+		{Code: "content_unchanged", Message: "the model returned the file unchanged, which is not a fix"},
+	}
+
+	out, err := tc.build().Propose(context.Background(), step.PromptInput{
+		Failure: f, Evidence: promptEvidence(), Round: 1,
+		Previous: &round1.Draft, PreviousRequest: &m.reqs[0], PreviousAnswer: &first, Findings: findings,
+	}, m)
+
+	require.NoError(t, err)
+	require.Len(t, m.reqs, 2, "a later round makes one model call")
+	assert.Equal(t, prompt.Revise(m.reqs[0], step.AnswerJSON(first), step.FindingLines(findings)), m.reqs[1])
+	assert.NotEqual(t, m.reqs[0], m.reqs[1])
+	again := proposeWith(t, tc.build(), f, promptEvidence(), answers(second))
+	assert.Equal(t, again.Draft, out.Draft, "the answer is read as the first round's answer is")
+}
+
+func TestPythonContract_RevisesTheLastCallWithTheFindings(t *testing.T) {
+	revisesTheLastCall(t, promptCases()[0])
+}
+
+func TestPythonParse_RevisesTheLastCallWithTheFindings(t *testing.T) {
+	revisesTheLastCall(t, promptCases()[1])
+}
+
+func TestCSVContract_RevisesTheLastCallWithTheFindings(t *testing.T) {
+	revisesTheLastCall(t, promptCases()[2])
+}
+
+func TestPrompts_ALaterRoundWithoutThePreviousCallIsAnErrorAndCallsNoModel(t *testing.T) {
+	req, res := prompt.ProposeRequest{User: "u"}, answer()
+	cases := map[string]step.PromptInput{
+		"no previous call":    {Round: 1},
+		"no previous request": {Round: 1, PreviousAnswer: &res},
+		"no previous answer":  {Round: 1, PreviousRequest: &req},
+	}
+	for _, tc := range promptCases() {
+		for name, in := range cases {
+			t.Run(tc.name+" "+name, func(t *testing.T) {
+				in.Failure, in.Evidence = failure(nil), promptEvidence()
+				m := answers(answer())
+
+				_, err := tc.build().Propose(context.Background(), in, m)
+
+				require.Error(t, err)
+				assert.ErrorContains(t, err, tc.wantStep)
+				assert.Empty(t, m.reqs)
+			})
+		}
 	}
 }

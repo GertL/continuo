@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,7 +37,7 @@ const (
 // The cluster and round of a flow-level step's journal row: a cross-cluster
 // check, the gate or an output.
 const (
-	flowCluster = 0
+	flowCluster = remediation.FlowCluster
 	flowRound   = 1
 	// flowGateRowName is the step name of the gate's row for a flow that names
 	// no gate step.
@@ -256,10 +257,12 @@ func (r *Runner) recordAttempt(ctx context.Context, u uow.UnitOfWork, run tryRun
 // its attempt is recorded with what its clusters reported, the try fails and
 // the remediation is done. Any other drafting try moves to checking. A
 // checking try runs the flow's cross-cluster checks one at a time, in file
-// order, each committed on its own; a finding fails the attempt and ends the
-// remediation. Once every check passed, the drafts are submitted to the gate.
-// The checked drafts are rebuilt from the journal each time, and a failure to
-// read them back is counted on the runner's drafts row.
+// order, each committed on its own; a finding fails the attempt and the try,
+// like a gate that did not pass the fix, and the remediation's next try opens
+// in the drive's next step, or the failing set is handed over once the tries
+// are spent. Once every check passed, the drafts are submitted to the gate. The
+// checked drafts are rebuilt from the journal each time, and a failure to read
+// them back is counted on the runner's drafts row.
 func (r *Runner) finishTry(ctx context.Context, run tryRun) error {
 	checked, err := r.checkedClusters(run)
 	if err != nil {
@@ -280,11 +283,11 @@ func (r *Runner) finishTry(ctx context.Context, run tryRun) error {
 	for _, ref := range run.flow.AcrossClusters {
 		row, done := run.journal.done(flowCluster, string(ref.Name), flowRound)
 		if !done {
-			return r.runCrossCheck(ctx, run, drafts, ref.Name)
+			return r.runCrossCheck(ctx, run, checked, ref.Name)
 		}
 		if len(row.Findings) > 0 {
 			return r.commitFlowStep(ctx, run, row, func(u uow.UnitOfWork) error {
-				return r.refuseAttempt(ctx, u, run, row.Findings[0].Message)
+				return r.failTryOnFindings(ctx, u, run, checked, row.Step, row.Findings)
 			})
 		}
 	}
@@ -310,10 +313,11 @@ func (r *Runner) settleTry(ctx context.Context, run tryRun, checked []checkedClu
 	return nil
 }
 
-// runCrossCheck runs one cross-cluster check over the try's drafts and commits
-// its row. A finding fails the attempt with the finding's message and ends the
-// remediation in the same transaction.
-func (r *Runner) runCrossCheck(ctx context.Context, run tryRun, drafts []step.ClusterDraft, name workflow.StepName) error {
+// runCrossCheck runs one cross-cluster check over the drafts of the try's
+// checked clusters and commits its row. A finding fails the attempt with the
+// finding and fails the try in the same transaction.
+func (r *Runner) runCrossCheck(ctx context.Context, run tryRun, checked []checkedCluster, name workflow.StepName) error {
+	drafts := draftsOf(checked)
 	row := r.newRow(run, flowCluster, string(name), string(step.KindCheck), flowRound, run.flow.Revision)
 	chk, err := lookup[step.CrossCheck](r.d.Registry, name, step.KindCheck)
 	if err != nil {
@@ -331,12 +335,11 @@ func (r *Runner) runCrossCheck(ctx context.Context, run tryRun, drafts []step.Cl
 	}
 	row.Findings = res.Findings
 	r.finish(&row)
-	f, refused := firstFinding([]remediation.CheckResult{res})
 	return r.commitFlowStep(ctx, run, row, func(u uow.UnitOfWork) error {
-		if !refused {
+		if len(res.Findings) == 0 {
 			return nil
 		}
-		return r.refuseAttempt(ctx, u, run, f.Message)
+		return r.failTryOnFindings(ctx, u, run, checked, string(name), res.Findings)
 	})
 }
 
@@ -360,20 +363,51 @@ func (r *Runner) commitFlowStep(ctx context.Context, run tryRun, row remediation
 	return nil
 }
 
-// refuseAttempt records the attempt failed for reason on every node of the
-// trigger, fails the try and ends the remediation, in u's transaction: no
-// verification run could judge the try's edits.
-func (r *Runner) refuseAttempt(ctx context.Context, u uow.UnitOfWork, run tryRun, reason string) error {
-	r.logger.Error("the attempt's edits cannot be verified by any release",
-		"remediation", run.snap.Remediation.ID, "release", run.trigger.ReleaseID, "attempt", run.snap.Try.Attempt, "error", reason)
-	if err := r.recordAttempt(ctx, u, run, run.snap.Try.Attempt, proposal.Proposal{
-		Status:       proposal.StatusFailed,
-		NodeOutcomes: outcomesFor(run.trigger.NodeIDs(), proposal.NodeOutcome{Status: proposal.StatusFailed, Reason: reason}),
-		Rationale:    reason,
-	}); err != nil {
+// failTryOnFindings fails the try because the check name, a cross-cluster
+// check or the gate refusing the drafts at submit, found findings in the drafts
+// of the checked clusters, in u's transaction: the attempt is recorded failed,
+// with the findings' messages as its reason (recordRefusal), and the try fails
+// while the remediation keeps running, so the next try opens and is shown the
+// findings among the earlier tries.
+func (r *Runner) failTryOnFindings(ctx context.Context, u uow.UnitOfWork, run tryRun, checked []checkedCluster, name string, findings []remediation.Finding) error {
+	reason := findingsReason(findings)
+	r.logger.Warn("a check refused the try's drafts; the try fails",
+		"remediation", run.snap.Remediation.ID, "release", run.trigger.ReleaseID, "try", run.snap.Try.Try,
+		"attempt", run.snap.Try.Attempt, "check", name, "reason", reason)
+	if err := r.recordRefusal(ctx, u, run, checked, reason); err != nil {
 		return err
 	}
-	return r.endTry(ctx, u, run, remediation.TryFailed)
+	return r.saveTry(ctx, u, *run.snap.Try, remediation.TryFailed, time.Time{})
+}
+
+// recordRefusal records the attempt of the current try failed for reason, in
+// u's transaction. The members of each checked cluster whose draft has an edit,
+// the drafts the refusing check judged, fail for reason; every other node keeps
+// how its cluster ended (nodeOutcomes), such as a cluster handed over before
+// any draft.
+func (r *Runner) recordRefusal(ctx context.Context, u uow.UnitOfWork, run tryRun, checked []checkedCluster, reason string) error {
+	outcomes := nodeOutcomes(run.snap.Clusters, checked)
+	refused := proposal.NodeOutcome{Status: proposal.StatusFailed, Reason: reason}
+	for _, d := range draftsOf(checked) {
+		for _, m := range d.Cluster.Members {
+			outcomes[m] = refused
+		}
+	}
+	return r.recordAttempt(ctx, u, run, run.snap.Try.Attempt, proposal.Proposal{
+		Status:       proposal.StatusFailed,
+		NodeOutcomes: outcomes,
+		Rationale:    reason,
+	})
+}
+
+// findingsReason is the messages of findings joined by "; ", the way a failed
+// gate's findings are shown to the next try.
+func findingsReason(findings []remediation.Finding) string {
+	messages := make([]string, 0, len(findings))
+	for _, f := range findings {
+		messages = append(messages, f.Message)
+	}
+	return strings.Join(messages, "; ")
 }
 
 // saveTry moves t to the status to in u's transaction, refusing a move the
