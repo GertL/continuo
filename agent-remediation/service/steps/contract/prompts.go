@@ -34,7 +34,7 @@ func NewPythonContract(sanitizer ports.LogSanitizer) step.Prompt {
 	return &contractPrompt{
 		name: "python-contract",
 		description: "Shows the model a python node's contract yaml with the validation error, runner log, the contract entry the release recorded, " +
-			"upstream changes, precedent and earlier attempts, and reads back the complete new content of every contract file it changes.",
+			"upstream changes, precedent and, when there are any, the earlier tries at the failure in its first-round request, and reads back the complete new content of every contract file it changes.",
 		assemble:  prompt.AssemblePythonContractFix,
 		sanitizer: sanitizer,
 	}
@@ -45,7 +45,7 @@ func NewPythonContract(sanitizer ports.LogSanitizer) step.Prompt {
 func NewPythonParse(sanitizer ports.LogSanitizer) step.Prompt {
 	return &contractPrompt{
 		name: "python-parse",
-		description: "Shows the model a python node's contract yaml with the SQL parser's error, upstream changes, precedent and earlier attempts, " +
+		description: "Shows the model a python node's contract yaml with the SQL parser's error, upstream changes, precedent and, when there are any, the earlier tries at the failure in its first-round request, " +
 			"and reads back the complete new content of every contract file it changes.",
 		assemble:  prompt.AssemblePythonParseFix,
 		sanitizer: sanitizer,
@@ -58,7 +58,7 @@ func NewCSVContract(sanitizer ports.LogSanitizer) step.Prompt {
 	return &contractPrompt{
 		name: "csv-contract",
 		description: "Shows the model a python-csv node's contract yaml with the validation error, the header check's runner log, the contract entry the release recorded, " +
-			"upstream changes, precedent and earlier attempts, and reads back the complete new content of every contract file it changes.",
+			"upstream changes, precedent and, when there are any, the earlier tries at the failure in its first-round request, and reads back the complete new content of every contract file it changes.",
 		assemble: func(ev prompt.PythonEvidence) prompt.ProposeRequest {
 			return prompt.AssembleCsvContractFix(prompt.CsvEvidence(ev))
 		},
@@ -79,51 +79,44 @@ func (p *contractPrompt) Meta() step.Meta {
 			remediation.KeyDBTLog,
 			remediation.KeyUpstreamChanges,
 			remediation.KeyFailurePrecedents,
-			remediation.KeyPriorAttempts,
 		},
 	}
 }
 
-// Propose assembles what the model is shown. The failure text and the
-// declaring file are required; the runner log, the bundle's contract entry,
-// upstream changes, precedent and prior attempts each degrade to their own
-// absence, because a missing evidence section costs the model context while a
-// blocked heal costs the operator the fix entirely. The error excerpt and the
+// Propose makes the model call and reads its answer into a draft. In the first
+// round it assembles what the model is shown, with the earlier tries at the
+// failure (step.WithPreviousTries). The failure text and the declaring file are
+// required; the runner log, the bundle's contract entry, upstream changes,
+// precedent and the earlier tries each degrade to their own absence, because a
+// missing evidence section costs the model context while a blocked heal costs
+// the operator the fix entirely. The error excerpt and the
 // yaml text are sanitized here, since they leave for an external model, and the
-// other sections arrive sanitized from the steps that gathered them.
+// other sections arrive sanitized from the steps that gathered them. In a round
+// after the first the request is the revision of the last round's request with
+// its answer and the findings (step.RevisionRequest), and the answer is read the
+// same way.
 //
 // The draft holds one edit for each file the model answered with, naming the
 // path it answered and the content it gave. Each edit's original is left empty:
 // the checks read it from a checkout of the repository. A draft with no edit
 // is what an answer with no file gives.
 func (p *contractPrompt) Propose(ctx context.Context, in step.PromptInput, m step.Model) (step.PromptOutput, error) {
-	file, ok := remediation.Get[remediation.ContractFile](in.Evidence, remediation.KeyContractFile)
-	if !ok {
-		return step.PromptOutput{}, fmt.Errorf("%s: the evidence holds no contract file", p.name)
+	req, revising, err := step.RevisionRequest(in)
+	if err != nil {
+		return step.PromptOutput{}, fmt.Errorf("%s: %w", p.name, err)
 	}
-	entry, _ := remediation.Get[remediation.Text](in.Evidence, remediation.KeyContractEntry)
-	dbtLog, _ := remediation.Get[remediation.Text](in.Evidence, remediation.KeyDBTLog)
-	upstream, _ := remediation.Get[[]prompt.UpstreamChange](in.Evidence, remediation.KeyUpstreamChanges)
-	precedents, _ := remediation.Get[[]prompt.Precedent](in.Evidence, remediation.KeyFailurePrecedents)
-	attempts, _ := remediation.Get[[]prompt.PriorAttempt](in.Evidence, remediation.KeyPriorAttempts)
+	if !revising {
+		if req, err = p.request(in); err != nil {
+			return step.PromptOutput{}, err
+		}
+	}
 
-	f := in.Failure
-	res, err := m.Propose(ctx, p.assemble(prompt.PythonEvidence{
-		NodeID:          f.Target.NodeID,
-		NoReads:         f.Target.NodeType == string(pkgmodel.NodeTypePythonApi),
-		ErrorExcerpt:    p.sanitizer.Sanitize(f.Target.ErrorExcerpt),
-		RunnerLog:       string(dbtLog),
-		ContractEntry:   string(entry),
-		YAMLPath:        file.YAMLPath,
-		YAMLText:        p.sanitizer.Sanitize(file.YAMLText),
-		UpstreamChanges: upstream,
-		Precedents:      precedents,
-		PriorAttempts:   attempts,
-	}))
+	res, err := m.Propose(ctx, req)
 	if err != nil {
 		return step.PromptOutput{}, fmt.Errorf("llm propose: %w", err)
 	}
 
+	f := in.Failure
 	draft := remediation.Draft{
 		Rationale:  res.Rationale,
 		Confidence: res.Confidence,
@@ -142,6 +135,31 @@ func (p *contractPrompt) Propose(ctx context.Context, in step.PromptInput, m ste
 	// The edits name real files of the repository at the trigger's commit.
 	draft.SourceResolved = len(draft.Edits) > 0
 	return step.PromptOutput{Draft: draft}, nil
+}
+
+// request assembles the first round's request from the cluster's evidence.
+func (p *contractPrompt) request(in step.PromptInput) (prompt.ProposeRequest, error) {
+	file, ok := remediation.Get[remediation.ContractFile](in.Evidence, remediation.KeyContractFile)
+	if !ok {
+		return prompt.ProposeRequest{}, fmt.Errorf("%s: the evidence holds no contract file", p.name)
+	}
+	entry, _ := remediation.Get[remediation.Text](in.Evidence, remediation.KeyContractEntry)
+	dbtLog, _ := remediation.Get[remediation.Text](in.Evidence, remediation.KeyDBTLog)
+	upstream, _ := remediation.Get[[]prompt.UpstreamChange](in.Evidence, remediation.KeyUpstreamChanges)
+	precedents, _ := remediation.Get[[]prompt.Precedent](in.Evidence, remediation.KeyFailurePrecedents)
+
+	f := in.Failure
+	return step.WithPreviousTries(p.assemble(prompt.PythonEvidence{
+		NodeID:          f.Target.NodeID,
+		NoReads:         f.Target.NodeType == string(pkgmodel.NodeTypePythonApi),
+		ErrorExcerpt:    p.sanitizer.Sanitize(f.Target.ErrorExcerpt),
+		RunnerLog:       string(dbtLog),
+		ContractEntry:   string(entry),
+		YAMLPath:        file.YAMLPath,
+		YAMLText:        p.sanitizer.Sanitize(file.YAMLText),
+		UpstreamChanges: upstream,
+		Precedents:      precedents,
+	}), in.Evidence), nil
 }
 
 // editKeys are the keys under which the runner stores the content and the diff

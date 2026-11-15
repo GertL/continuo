@@ -40,7 +40,7 @@ var _ step.Prompt = (*sourcePrompt)(nil)
 func NewDBTCompile(sanitizer ports.LogSanitizer) step.Prompt {
 	return &sourcePrompt{
 		name:         "dbt-compile",
-		description:  "Shows the model the files around a failed dbt compile with the dbt log, and reads back the corrected content of the one file it chooses.",
+		description:  "Shows the model the files around a failed dbt compile with the dbt log, and reads back the corrected content of the one file it chooses. The first-round request carries the earlier tries at the failure, when there are any.",
 		readsLog:     true,
 		suspectsRoot: true,
 		sanitizer:    sanitizer,
@@ -57,7 +57,7 @@ func NewDBTCompile(sanitizer ports.LogSanitizer) step.Prompt {
 func NewDBTParse(sanitizer ports.LogSanitizer) step.Prompt {
 	return &sourcePrompt{
 		name:         "dbt-parse",
-		description:  "Shows the model the files around a node whose SQL the parser rejected with the parser's error, and reads back the corrected content of the one file it chooses.",
+		description:  "Shows the model the files around a node whose SQL the parser rejected with the parser's error, and reads back the corrected content of the one file it chooses. The first-round request carries the earlier tries at the failure, when there are any.",
 		suspectsRoot: true,
 		sanitizer:    sanitizer,
 		pick:         pickNamed,
@@ -72,7 +72,7 @@ func NewDBTParse(sanitizer ports.LogSanitizer) step.Prompt {
 func NewSeed(sanitizer ports.LogSanitizer) step.Prompt {
 	return &sourcePrompt{
 		name:        "seed",
-		description: "Shows the model a seed's csv with the dbt log, and reads back the corrected csv.",
+		description: "Shows the model a seed's csv with the dbt log, and reads back the corrected csv. The first-round request carries the earlier tries at the failure, when there are any.",
 		readsLog:    true,
 		sanitizer:   sanitizer,
 		pick: func(_ ports.ProposeResult, files remediation.SourceFiles) (string, bool) {
@@ -89,7 +89,7 @@ func NewSeed(sanitizer ports.LogSanitizer) step.Prompt {
 func NewDuplicateTable(sanitizer ports.LogSanitizer) step.Prompt {
 	return &sourcePrompt{
 		name:         "duplicate-table",
-		description:  "Shows the model the changed claimant of a relation two models produce, names the other producer, and reads back the corrected content of the claimant's file.",
+		description:  "Shows the model the changed claimant of a relation two models produce, names the other producer, and reads back the corrected content of the claimant's file. The first-round request carries the earlier tries at the failure, when there are any.",
 		suspectsRoot: true,
 		sanitizer:    sanitizer,
 		pick:         pickNamed,
@@ -117,27 +117,43 @@ func (p *sourcePrompt) Meta() step.Meta {
 }
 
 // Propose builds the request from the cluster's evidence, calls the model once
-// and reads its answer into a draft. The draft names the file the model chose.
-// When that file is one the model was shown, the draft holds one edit of it,
-// whose content may still be empty or unchanged for the checks to refuse; when
-// it is not, the draft holds no edit and says the target was not shown.
+// and reads its answer into a draft. In a round after the first the request is
+// the revision of the last round's request with its answer and the findings
+// (step.RevisionRequest), and the answer is read the same way. The draft names
+// the file the model chose. When that file is one the model was shown, the draft
+// holds one edit of it, whose content may still be empty or unchanged for the
+// checks to refuse; when it is not, the draft holds no edit and says the target
+// was not shown.
 func (p *sourcePrompt) Propose(ctx context.Context, in step.PromptInput, m step.Model) (step.PromptOutput, error) {
 	files, ok := remediation.Get[remediation.SourceFiles](in.Evidence, remediation.KeySourceFiles)
 	if !ok {
 		return step.PromptOutput{}, fmt.Errorf("%s: the evidence holds no source files", p.name)
 	}
+	req, revising, err := step.RevisionRequest(in)
+	if err != nil {
+		return step.PromptOutput{}, fmt.Errorf("%s: %w", p.name, err)
+	}
+	if !revising {
+		req = p.request(in, files)
+	}
+
+	res, err := m.Propose(ctx, req)
+	if err != nil {
+		return step.PromptOutput{}, fmt.Errorf("llm propose: %w", err)
+	}
+	return step.PromptOutput{Draft: p.draft(in.Failure, files, res)}, nil
+}
+
+// request builds the first round's request from the cluster's evidence, with
+// the earlier tries at the failure (step.WithPreviousTries).
+func (p *sourcePrompt) request(in step.PromptInput, files remediation.SourceFiles) prompt.ProposeRequest {
 	var dbtLog string
 	if p.readsLog {
 		log, _ := remediation.Get[remediation.Text](in.Evidence, remediation.KeyDBTLog)
 		dbtLog = string(log)
 	}
 	precedents, _ := remediation.Get[[]prompt.Precedent](in.Evidence, remediation.KeyFailurePrecedents)
-
-	res, err := m.Propose(ctx, p.build(p.sanitizer, in.Failure, files, dbtLog, precedents))
-	if err != nil {
-		return step.PromptOutput{}, fmt.Errorf("llm propose: %w", err)
-	}
-	return step.PromptOutput{Draft: p.draft(in.Failure, files, res)}, nil
+	return step.WithPreviousTries(p.build(p.sanitizer, in.Failure, files, dbtLog, precedents), in.Evidence)
 }
 
 // draft reads the model's answer into a draft. The edit's original is the file

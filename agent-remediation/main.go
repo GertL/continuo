@@ -324,6 +324,7 @@ func main() {
 	// now. Its built-in files are checked against the steps the registry holds
 	// before anything starts, and a refused file stops startup.
 	newUoW := func() uow.UnitOfWork { return postgres.NewUnitOfWork(db, logger, cfg.ServiceRepoPaths) }
+	remediationRepo := postgres.NewRemediationRepository(db)
 	collab := runnerCollaborators(cfg, runnerAdapters{
 		github:    gh,
 		evidence:  evidenceReader,
@@ -334,6 +335,7 @@ func main() {
 		packager:  packager,
 		release:   releaseGateway,
 		proposals: proposalRepo,
+		tries:     remediationRepo,
 	}, logger)
 	files, err := loadRunnerFiles(workflows.Builtin, collab, logger)
 	if err != nil {
@@ -341,7 +343,6 @@ func main() {
 		os.Exit(1)
 	}
 	warnIgnoredMaxAttempts(cfg, files, logger)
-	remediationRepo := postgres.NewRemediationRepository(db)
 	accept := startRunner(ctx, cfg, collab, files, runnerWiring{
 		llm:    cachedLLM,
 		newUoW: newUoW,
@@ -653,6 +654,7 @@ type runnerAdapters struct {
 		ports.VerificationPipeline
 	}
 	proposals repository.AttemptLister
+	tries     repository.TryLister
 }
 
 // runnerCollaborators is the ports the steps are built from: the adapters main
@@ -679,6 +681,7 @@ func runnerCollaborators(cfg config.Config, a runnerAdapters, logger *slog.Logge
 		Packager:            a.packager,
 		Releases:            a.release,
 		PriorAttempts:       a.proposals,
+		Tries:               a.tries,
 		SQLDialect:          cfg.SQLDialect,
 		Pipeline:            a.release,
 		Clock:               ports.SystemClock{},

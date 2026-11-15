@@ -50,8 +50,10 @@ func gateInput(run tryRun, drafts []step.ClusterDraft, proposalID string, submit
 // answer with the gate's row. A gate that started its runs leaves the try
 // verifying: the attempt's proposal row records the runs, the edits and the
 // composed rationale, and the gate's row waits on the runs. A gate that
-// refused the drafts fails the attempt with its first finding and ends the
-// remediation.
+// refused the drafts without starting a run fails the attempt with its findings
+// and fails the try, in one transaction with the gate's row, as a cross-cluster
+// finding does (failTryOnFindings): the next try opens in the drive's next
+// step, or the failing set is handed over once the tries are spent.
 func (r *Runner) submitGate(ctx context.Context, run tryRun, checked []checkedCluster) error {
 	name, gate, err := r.gateStep(run.flow)
 	row := r.newRow(run, flowCluster, string(name), string(step.KindCheck), flowRound, run.flow.Revision)
@@ -74,18 +76,17 @@ func (r *Runner) submitGate(ctx context.Context, run tryRun, checked []checkedCl
 	if err != nil {
 		return r.recordFailure(ctx, row, fmt.Errorf("step %s: %w", name, err))
 	}
-	if row.Output, err = serialization.EncodeRecord(serialization.CheckRecord{Result: verdict.Result}); err != nil {
+	if row.Output, err = serialization.EncodeRecord(serialization.CheckRecord{Result: verdict.Result, Gate: true}); err != nil {
 		return r.recordFailure(ctx, row, fmt.Errorf("encode the output of step %s: %w", name, err))
 	}
 	if !verdict.Result.Waiting {
-		f, refused := firstFinding([]remediation.CheckResult{verdict.Result})
-		if !refused {
+		if _, refused := firstFinding([]remediation.CheckResult{verdict.Result}); !refused {
 			return r.recordFailure(ctx, row, fmt.Errorf("step %s neither started a verification run nor refused the try", name))
 		}
 		row.Findings = verdict.Result.Findings
 		r.finish(&row)
 		return r.commitFlowStep(ctx, run, row, func(u uow.UnitOfWork) error {
-			return r.refuseAttempt(ctx, u, run, f.Message)
+			return r.failTryOnFindings(ctx, u, run, checked, row.Step, row.Findings)
 		})
 	}
 	row.Status = remediation.StepWaiting
@@ -304,7 +305,7 @@ func mergeVerifications(stored, read []proposal.Verification) []proposal.Verific
 
 // concluded is the gate's row once the gate gave its verdict res.
 func (r *Runner) concluded(row remediation.StepRun, res remediation.CheckResult) (remediation.StepRun, error) {
-	out, err := serialization.EncodeRecord(serialization.CheckRecord{Result: res})
+	out, err := serialization.EncodeRecord(serialization.CheckRecord{Result: res, Gate: true})
 	if err != nil {
 		return row, fmt.Errorf("encode the output of step %s: %w", row.Step, err)
 	}
