@@ -58,7 +58,7 @@ func NewRegistry(c Collaborators) *Registry {
 			remediation.KeyChangedAncestorDiffs: func() any { return []prompt.ReleaseUpstreamChange{} },
 			remediation.KeyContractFile:         func() any { return remediation.ContractFile{} },
 			remediation.KeyContractEntry:        func() any { return remediation.Text("") },
-			remediation.KeyPriorAttempts:        func() any { return []prompt.PriorAttempt{} },
+			remediation.KeyPreviousTries:        func() any { return []remediation.TryRecord{} },
 			remediation.KeyPackagedContract:     func() any { return remediation.Bytes{} },
 			remediation.KeyUpstreamTarget:       func() any { return remediation.UpstreamTarget{} },
 		},
@@ -68,6 +68,7 @@ func NewRegistry(c Collaborators) *Registry {
 	r.register(shared.NewUpstreamChanges(c.Upstream, c.Sanitizer, c.Logger))
 	r.register(shared.NewContentChanged())
 	r.register(shared.NewConfidenceNotLow())
+	r.register(shared.NewPreviousTries(c.Tries, c.PriorAttempts, c.Evidence, c.Sanitizer, c.Logger))
 	r.register(source.NewFailingNodeSource(c.Source, c.Locator, c.ServiceRepoPaths, c.Logger))
 	r.register(source.NewDBTCompile(c.Sanitizer))
 	r.register(source.NewDBTParse(c.Sanitizer))
@@ -78,11 +79,10 @@ func NewRegistry(c Collaborators) *Registry {
 	r.register(validation.NewCodeBundleSource(c.CandidateSource, c.Source, c.Locator, c.ServiceRepoPaths, c.Logger))
 	r.register(validation.NewOwnChangeDiff(c.Versions, c.Sanitizer, c.Logger))
 	r.register(validation.NewChangedAncestorDiffs(c.CandidateSource, c.Versions, c.Sanitizer, c.Logger))
-	r.register(validation.NewDBTValidation(c.Artifacts, c.Sanitizer, c.ServiceRepoPaths, c.Logger))
+	r.register(validation.NewDBTValidation(c.Artifacts, c.Sanitizer, c.ServiceRepoPaths))
 	r.register(contract.NewContractFile(c.Archive, c.ContractLocator, c.Logger))
 	r.register(contract.NewFailingSiblings(c.Archive, c.ContractLocator, c.Releases, c.Logger))
 	r.register(contract.NewContractEntry(c.CandidateSource, c.Sanitizer, c.Logger))
-	r.register(contract.NewPriorAttempts(c.PriorAttempts, c.Evidence, c.Sanitizer, c.Logger))
 	r.register(contract.NewPythonContract(c.Sanitizer))
 	r.register(contract.NewPythonParse(c.Sanitizer))
 	r.register(contract.NewCSVContract(c.Sanitizer))

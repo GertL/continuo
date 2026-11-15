@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/carolsimone/continuo/agent-remediation/adapters/memory"
+	"github.com/carolsimone/continuo/agent-remediation/adapters/repofs"
 	"github.com/carolsimone/continuo/agent-remediation/domain/prompt"
 	"github.com/carolsimone/continuo/agent-remediation/domain/proposal"
 	"github.com/carolsimone/continuo/agent-remediation/domain/remediation"
@@ -122,6 +123,17 @@ func (e fakeEvidence) Fetch(_ context.Context, uri string) (string, error) {
 type nopSanitizer struct{}
 
 func (nopSanitizer) Sanitize(s string) string { return s }
+
+// noUpstream is a graph that knows no change upstream of any node.
+type noUpstream struct{}
+
+func (noUpstream) UpstreamChanges(context.Context, string) ([]prompt.UpstreamChange, error) {
+	return nil, nil
+}
+
+// contractFiles searches and reads a checkout's contract yaml as the service
+// does.
+var contractFiles = repofs.NewLocator(discard)
 
 type noPrecedents struct{}
 
@@ -399,7 +411,7 @@ func testFiles(tries int) workflow.Set {
 			[]string{"target_file_was_shown", "content_changed", "confidence_not_low"}),
 		typ("dbt-validation", workflow.Match{Cluster: workflow.ClusterSingle, Source: "validation", NodeTypes: []string{"dbt-model", "dbt-seed", "dbt-snapshot", "none"}},
 			[]string{"candidate_sql", "dbt_log", "code_bundle_source", "own_change_diff", "upstream_changes", "changed_ancestor_diffs", "failure_precedents"},
-			"dbt-validation", []string{"content_changed"}),
+			"dbt-validation", []string{"content_changed", "confidence_not_low"}),
 		typ("shared-upstream", workflow.Match{Cluster: workflow.ClusterSharedUpstream},
 			[]string{"upstream_target", "failure_precedents"}, "upstream", []string{"content_changed", "confidence_not_low"}),
 		typ("cross-service-upstream", workflow.Match{Cluster: workflow.ClusterCrossService},
@@ -428,8 +440,12 @@ type harness struct {
 	files       workflow.Set
 	maintenance bool
 	stepTimeout time.Duration
-	collab      runner.Collaborators
-	runner      *runner.Runner
+	// archive and packager are the repository checkout and the contract
+	// packaging tool the contract steps read, nil unless a test sets them.
+	archive  ports.RepoArchive
+	packager ports.ContractPackager
+	collab   runner.Collaborators
+	runner   *runner.Runner
 
 	// afterCommit runs after every unit of work of the runner commits.
 	afterCommit func()
@@ -492,12 +508,32 @@ func withTries(n int) option {
 	return func(h *harness) { h.files = testFiles(n) }
 }
 
+// withRounds gives every type of the harness rounds pre-flight rounds.
+func withRounds(rounds int) option {
+	return func(h *harness) {
+		for name, typ := range h.files.Types {
+			typ.Agent.Rounds = rounds
+			h.files.Types[name] = typ
+		}
+	}
+}
+
 // withoutCrossClusterChecks gives the flow no cross-cluster check, so the gate
 // is the first to see the try's drafts together.
 func withoutCrossClusterChecks() option {
 	return func(h *harness) {
 		flow := h.files.Flows["rejected-release"]
 		flow.AcrossClusters = nil
+		h.files.Flows[flow.Name] = flow
+	}
+}
+
+// withPreviousTries gives the flow the context step previous_tries, as the
+// built-in flow lists it.
+func withPreviousTries() option {
+	return func(h *harness) {
+		flow := h.files.Flows["rejected-release"]
+		flow.Context = refs("previous_tries")
 		h.files.Flows[flow.Name] = flow
 	}
 }
@@ -549,9 +585,17 @@ func newHarness(t *testing.T, opts ...option) *harness {
 			"core":  "services/core",
 		},
 		Precedents:          noPrecedents{},
+		Upstream:            noUpstream{},
+		PriorAttempts:       h.store.ProposalRepository(),
+		Tries:               h.store.RemediationRepository(),
 		CandidateSource:     h.bundle,
 		Versions:            noVersions{},
 		Releases:            fakeReleases{},
+		Archive:             h.archive,
+		Patcher:             repofs.CheckoutPatcher{},
+		ContractLocator:     contractFiles,
+		ContractInspector:   contractFiles,
+		Packager:            h.packager,
 		Pipeline:            h.pipeline,
 		Clock:               h.clock,
 		VerificationTimeout: verificationTimeout,

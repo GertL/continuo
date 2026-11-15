@@ -55,8 +55,8 @@ func TestFiles_BuiltinDirPasses(t *testing.T) {
 	assert.Empty(t, r.Warnings)
 	// 1 flow, 10 types, 10 type fixtures and 7 flow fixtures.
 	assert.Equal(t, 28, r.Files)
-	// 10 types x 7 type scenarios, then 1 flow x 7 flow scenarios.
-	require.Len(t, r.Scenarios, 77)
+	// 10 types x 8 type scenarios, then 1 flow x 7 flow scenarios.
+	require.Len(t, r.Scenarios, 87)
 	for _, s := range r.Scenarios {
 		assert.True(t, s.OK, "%s %s: %s", s.Type, s.Scenario, s.Error)
 		assert.Empty(t, s.Error)
@@ -243,11 +243,11 @@ func TestFiles_FilesWithoutTheTriggerFlowExitOne(t *testing.T) {
 	assert.Empty(t, r.Scenarios)
 }
 
-// The runner runs one pre-flight round per try, so a type that asks for two is
+// A type runs at least one pre-flight round, so a type that asks for none is
 // refused at its agent line, as the service refuses it at startup.
-func TestFiles_ATypeWithTwoRoundsExitsOne(t *testing.T) {
+func TestFiles_ATypeWithNoRoundsExitsOne(t *testing.T) {
 	dir := copyBuiltinEditing(t, filepath.Join("types", "dbt-compile.yaml"), func(typ string) string {
-		return strings.Replace(typ, "rounds: 1", "rounds: 2", 1)
+		return strings.Replace(typ, "rounds: 3", "rounds: 0", 1)
 	})
 
 	code, stdout, stderr := runFiles(t, "files", dir)
@@ -255,6 +255,29 @@ func TestFiles_ATypeWithTwoRoundsExitsOne(t *testing.T) {
 	assert.Equal(t, 1, code, stderr)
 	r := decode(t, stdout)
 	require.Len(t, r.Errors, 1, "%v", r.Errors)
-	assert.Equal(t, `types/dbt-compile.yaml:8: type "dbt-compile" has rounds 2, and the runner runs one pre-flight round per try, so rounds must be 1`, r.Errors[0])
+	assert.Equal(t, `types/dbt-compile.yaml:8: type "dbt-compile" has rounds 0, and a type runs at least one pre-flight round, so rounds must be 1 or more`, r.Errors[0])
 	assert.Empty(t, r.Scenarios, "the suite is skipped when the files do not validate")
+}
+
+func TestFiles_ATypeOfOneRoundPasses(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.CopyFS(dir, os.DirFS(builtinDir)))
+	root, err := os.OpenRoot(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = root.Close() })
+	const typeFile = "types/dbt-compile.yaml"
+	body, err := root.ReadFile(typeFile)
+	require.NoError(t, err)
+	oneRound := strings.Replace(string(body), "rounds: 3", "rounds: 1", 1)
+	require.NotEqual(t, string(body), oneRound)
+	require.NoError(t, root.WriteFile(typeFile, []byte(oneRound), 0o600))
+
+	code, stdout, stderr := runFiles(t, "files", dir)
+
+	r := decode(t, stdout)
+	require.NotEmpty(t, r.Scenarios)
+	for _, s := range r.Scenarios {
+		assert.True(t, s.OK, "%s %s: %s", s.Type, s.Scenario, s.Error)
+	}
+	assert.Equal(t, 0, code, "stderr: %s", stderr)
 }

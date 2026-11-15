@@ -376,6 +376,41 @@ func TestRunner_EveryStepWritesOneJournalRow(t *testing.T) {
 	assert.False(t, p.CacheHit)
 }
 
+func TestRunner_ThePromptRowStoresTheLastModelCall(t *testing.T) {
+	h := newHarness(t)
+	id := h.accept(trigger("compile", compileNode("svc-a")))
+
+	require.NoError(t, h.runner.Drive(ctx, id))
+
+	rec, err := serialization.DecodeRecord[serialization.PromptRecord](h.stepRows(id, 1, 1)["dbt-compile"][0].Output)
+	require.NoError(t, err)
+	require.NotNil(t, rec.LastRequest)
+	require.NotNil(t, rec.LastAnswer)
+	req := h.llm.lastRequest()
+	assert.Equal(t, req, rec.LastRequest.Request())
+	assert.Equal(t, fixAnswer(req), rec.LastAnswer.Answer())
+	assert.Equal(t, "select 2", rec.Draft.Edits[0].Content)
+}
+
+func TestRunner_ARestartThatReplaysTheCachedAnswerStoresTheSameLastModelCall(t *testing.T) {
+	h := newHarness(t)
+	h.llm.onCall = func(int) { h.store.FailNextCommit() }
+	id := h.accept(trigger("compile", compileNode("svc-a")))
+	require.Error(t, h.runner.Drive(ctx, id), "the prompt step's commit fails after the model call")
+
+	h.llm.onCall = nil
+	require.NoError(t, h.runner.Drive(ctx, id))
+
+	assert.Equal(t, 1, h.llm.calls(), "the answer is replayed from the cache")
+	rec, err := serialization.DecodeRecord[serialization.PromptRecord](h.stepRows(id, 1, 1)["dbt-compile"][0].Output)
+	require.NoError(t, err)
+	require.NotNil(t, rec.LastRequest)
+	require.NotNil(t, rec.LastAnswer)
+	assert.Equal(t, h.llm.lastRequest(), rec.LastRequest.Request())
+	assert.Equal(t, "select 2", rec.LastAnswer.Answer().ProposedContent)
+	assert.True(t, rec.LastAnswer.Answer().Cached)
+}
+
 func TestRunner_AStepErrorIsRecordedAndRunsAgain(t *testing.T) {
 	h := newHarness(t)
 	h.source.fail = errors.New("github is down")
@@ -431,16 +466,16 @@ func TestRunner_PreflightFindingHandsTheClusterOver(t *testing.T) {
 		findings []string
 	}{
 		{
-			name:   "a target the model was not shown is skipped",
+			name:   "a target the model was not shown is failed",
 			answer: func(r *ports.ProposeResult) { r.TargetFile = "models/elsewhere.sql" },
-			outcome: proposal.NodeOutcome{Status: proposal.StatusSkipped,
-				Reason: `the model named "models/elsewhere.sql" as the file to change, which is not one of the files it was shown`},
+			outcome: proposal.NodeOutcome{Status: proposal.StatusFailed,
+				Reason: `pre-flight rounds spent: the model named "models/elsewhere.sql" as the file to change, which is not one of the files it was shown`},
 			findings: []string{"target_not_shown", "content_unchanged"},
 		},
 		{
 			name:     "a low-confidence draft is failed",
 			answer:   func(r *ports.ProposeResult) { r.Confidence = "low" },
-			outcome:  proposal.NodeOutcome{Status: proposal.StatusFailed, Reason: "the model could not determine a safe fix with confidence"},
+			outcome:  proposal.NodeOutcome{Status: proposal.StatusFailed, Reason: "pre-flight rounds spent: the model could not determine a safe fix with confidence"},
 			findings: []string{"low_confidence"},
 		},
 	}
@@ -645,15 +680,15 @@ func TestRunner_AnUndecodableRowIsRecordedOnTheNextStep(t *testing.T) {
 			id := h.accept(trigger("compile", compileNode("svc-a")))
 			require.NoError(t, h.runner.NextTry(ctx, id))
 			for _, name := range tc.done {
-				out := `{"evidence":{"failure_precedents":null}}`
-				switch name {
-				case tc.corrupt:
+				out, kind := `{"evidence":{"failure_precedents":null}}`, "context"
+				if name == "dbt-compile" {
+					out, kind = `{"draft":{}}`, "prompt"
+				}
+				if name == tc.corrupt {
 					out = `{"evidence":{"source_files":"not an object"},"draft":"not an object"}`
-				case "dbt-compile":
-					out = `{"draft":{}}`
 				}
 				h.saveStep(remediation.StepRun{
-					RemediationID: id, Try: 1, Cluster: 1, Step: name, Kind: "context", Round: 1,
+					RemediationID: id, Try: 1, Cluster: 1, Step: name, Kind: kind, Round: 1,
 					Status: remediation.StepDone, Output: []byte(out), StartedAt: t0,
 				})
 			}

@@ -2,6 +2,7 @@ package conformance_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"maps"
 	"slices"
@@ -139,8 +140,10 @@ func TestSuite_AFlowScenarioWithoutAFixtureFails(t *testing.T) {
 }
 
 // A fixture whose passing answer edits a file the model was never shown is
-// refused by pre-flight, so the scenarios that expect a proposal fail: the
-// suite judges what the files do, not only that they run.
+// refused by pre-flight, so every round the scenario scripted to pass asks for
+// a revision instead, and each scenario that expects a proposal fails, most on
+// the call its script holds no answer for: the suite judges what the files do,
+// not only that they run, and never answers a call twice.
 func TestSuite_AnAnswerPreflightRefusesFailsTheScenariosThatExpectAProposal(t *testing.T) {
 	s := onlyTypes(builtinSuite(t), "dbt-compile")
 	for i, f := range s.Fixtures {
@@ -158,21 +161,48 @@ func TestSuite_AnAnswerPreflightRefusesFailsTheScenariosThatExpectAProposal(t *t
 			errs[r.Scenario] = r.Err
 		}
 	}
-	const noEvent = "0 remediation.proposed events were enqueued, want 1"
-	for sc, want := range map[conformance.Scenario][]string{
-		conformance.FirstDraftPasses:    {"the attempts are [skipped], want [proposed]", noEvent},
-		conformance.GateFailsThenPasses: {"the attempts are [skipped], want [failed proposed]", noEvent},
-		conformance.TriesSpent:          {"the attempts are [skipped], want [failed failed failed escalated]", "attempt 1 carries no verify error"},
-		conformance.Redelivery:          {"the attempts are [skipped], want [proposed]", noEvent},
+	const unscripted = `model answers for calls about "svc", and this is call `
+	for sc, want := range map[conformance.Scenario]string{
+		conformance.FirstDraftPasses:        "the script holds 1 " + unscripted + "2",
+		conformance.PreflightRevisionPasses: "the script holds 2 " + unscripted + "3",
+		conformance.GateFailsNextTryLearns:  "the script holds 2 " + unscripted + "3",
+		// Three refused answers spend the first try's three rounds.
+		conformance.TriesSpent:    "the attempts are [failed], want [failed failed failed escalated]",
+		conformance.ModelDeclines: "the script holds 2 " + unscripted + "3",
+		conformance.Redelivery:    "the script holds 2 " + unscripted + "3",
 	} {
 		require.Error(t, errs[sc], "scenario %s", sc)
-		for _, w := range want {
-			assert.Contains(t, errs[sc].Error(), w, "scenario %s", sc)
+		assert.Contains(t, errs[sc].Error(), want, "scenario %s", sc)
+	}
+	assert.NoError(t, errs[conformance.PreflightRoundsSpent])
+	assert.NoError(t, errs[conformance.DeclinesBeforeModel])
+}
+
+// A fixture with no answer for a round its scenario plays fails that scenario
+// with the list it lacks, before anything runs.
+func TestSuite_AScenarioWhoseRoundHasNoAnswersFails(t *testing.T) {
+	s := onlyTypes(builtinSuite(t), "dbt-compile")
+	for i, f := range s.Fixtures {
+		if f.Type == "dbt-compile" {
+			s.Fixtures = slices.Clone(s.Fixtures)
+			s.Fixtures[i].Answers.Decline = nil
 		}
 	}
-	assert.NoError(t, errs[conformance.PreflightFails])
-	assert.NoError(t, errs[conformance.DeclinesBeforeModel])
-	assert.NoError(t, errs[conformance.ModelDeclines])
+
+	errs := map[conformance.Scenario]error{}
+	for _, r := range s.Run(ctx) {
+		if r.Type == "dbt-compile" {
+			errs[r.Scenario] = r.Err
+		}
+	}
+
+	require.Error(t, errs[conformance.ModelDeclines])
+	assert.Contains(t, errs[conformance.ModelDeclines].Error(), "has no answers.decline for round 1")
+	for _, sc := range conformance.TypeScenarios() {
+		if sc != conformance.ModelDeclines {
+			assert.NoError(t, errs[sc], "scenario %s", sc)
+		}
+	}
 }
 
 // extraRuns is a world that also reports verification runs of services no
@@ -239,13 +269,50 @@ func TestSuite_AFailureNamesItsServicesAndNodesInSortedOrder(t *testing.T) {
 		}
 		require.Error(t, errs[conformance.FirstDraftPasses])
 		assert.Contains(t, errs[conformance.FirstDraftPasses].Error(), runsText)
-		require.Error(t, errs[conformance.GateFailsThenPasses])
-		gate := errs[conformance.GateFailsThenPasses].Error()
+		require.Error(t, errs[conformance.GateFailsNextTryLearns])
+		gate := errs[conformance.GateFailsNextTryLearns].Error()
 		assert.Contains(t, gate, gateText)
 		assert.Less(t, strings.Index(gate, "alpha.node"), strings.Index(gate, "zeta.node"))
 		texts = append(texts, errs[conformance.FirstDraftPasses].Error()+"\n"+gate)
 	}
 	for _, text := range texts[1:] {
 		assert.Equal(t, texts[0], text)
+	}
+}
+
+// withRounds is the suite with every type allowing rounds pre-flight rounds
+// and the flow making tries tries.
+func withRounds(s conformance.Suite, rounds, tries int) conformance.Suite {
+	types := make(map[string]workflow.Type, len(s.Files.Types))
+	for name, typ := range s.Files.Types {
+		typ.Agent.Rounds = rounds
+		types[name] = typ
+	}
+	flow := s.Files.Flows[flowName]
+	flow.Tries = tries
+	s.Files = workflow.Set{Flows: map[string]workflow.Flow{flowName: flow}, Types: types}
+	return s
+}
+
+// Every scenario runs for every type whatever its rounds and its flow's
+// tries: a type of one round has its refused draft handed over where a type
+// that revises passes its revision, and a flow of one try hands over the
+// attempt whose verification failed.
+func TestSuite_EveryScenarioHoldsForTypesOfOneAndOfTwoRounds(t *testing.T) {
+	for _, tc := range []struct{ rounds, tries int }{{1, 3}, {2, 3}, {1, 1}} {
+		t.Run(fmt.Sprintf("rounds %d tries %d", tc.rounds, tc.tries), func(t *testing.T) {
+			s := withRounds(builtinSuite(t), tc.rounds, tc.tries)
+			_, err := runner.Validate(s.Files, runner.NewRegistry(runner.Collaborators{}))
+			require.NoError(t, err)
+
+			results := s.Run(ctx)
+			require.Len(t, results, len(s.Files.Flows[flowName].Types)*len(conformance.TypeScenarios()))
+			for _, r := range results {
+				assert.NoError(t, r.Err, "type %s, scenario %s", r.Type, r.Scenario)
+			}
+			for _, r := range s.RunFlowScenarios(ctx, flowName) {
+				assert.NoError(t, r.Err, "flow %s, scenario %s", r.Type, r.Scenario)
+			}
+		})
 	}
 }

@@ -33,7 +33,8 @@ func (*Prompt) Meta() step.Meta {
 		Name: "upstream",
 		Kind: step.KindPrompt,
 		Description: "Shows the model the changed ancestor's source with what this release changed in it, the failing members below it with their errors " +
-			"and past precedent, and reads back the ancestor's corrected source as the draft's one edit.",
+			"and past precedent, and reads back the ancestor's corrected source as the draft's one edit." +
+			" The first-round request carries the earlier tries at the failure, when there are any.",
 		Needs: []remediation.EvidenceKey{
 			remediation.KeyFailure,
 			remediation.KeyUpstreamTarget,
@@ -48,7 +49,9 @@ func (*Prompt) Meta() step.Meta {
 // external model; the edit's original is the file as the bundle holds it,
 // because the fix is applied to the real file. The edit's content may be empty
 // or equal to the original, for the checks to refuse. A cross-service cluster
-// asks the model to keep what the members read.
+// asks the model to keep what the members read. In a round after the first the
+// request is the revision of the last round's request with its answer and the
+// findings (step.RevisionRequest), and the answer is read the same way.
 func (p *Prompt) Propose(ctx context.Context, in step.PromptInput, m step.Model) (step.PromptOutput, error) {
 	target, ok := remediation.Get[remediation.UpstreamTarget](in.Evidence, remediation.KeyUpstreamTarget)
 	if !ok {
@@ -58,21 +61,16 @@ func (p *Prompt) Propose(ctx context.Context, in step.PromptInput, m step.Model)
 	if !ok {
 		return step.PromptOutput{}, fmt.Errorf("upstream: service %q has no repository path mapping", target.Service)
 	}
-	precedents, _ := remediation.Get[[]prompt.Precedent](in.Evidence, remediation.KeyFailurePrecedents)
-
-	f := in.Failure
-	members := make([]prompt.MemberFailure, 0, len(f.Members))
-	for _, n := range f.Members {
-		members = append(members, prompt.MemberFailure{NodeID: n.NodeID, Service: n.Service, ErrorExcerpt: p.sanitizer.Sanitize(n.ErrorExcerpt)})
+	req, revising, err := step.RevisionRequest(in)
+	if err != nil {
+		return step.PromptOutput{}, fmt.Errorf("upstream: %w", err)
 	}
-	res, err := m.Propose(ctx, prompt.AssembleUpstreamFix(prompt.UpstreamEvidence{
-		TargetNodeID:  target.NodeID,
-		TargetSource:  p.sanitizer.Sanitize(target.Source),
-		OwnChangeDiff: target.OwnChangeDiff,
-		Members:       members,
-		Precedents:    precedents,
-		CrossService:  f.Kind == workflow.ClusterCrossService,
-	}))
+	f := in.Failure
+	if !revising {
+		req = p.request(in, target)
+	}
+
+	res, err := m.Propose(ctx, req)
 	if err != nil {
 		return step.PromptOutput{}, fmt.Errorf("llm propose: %w", err)
 	}
@@ -91,6 +89,26 @@ func (p *Prompt) Propose(ctx context.Context, in step.PromptInput, m step.Model)
 		Model:          res.Model,
 		SourceResolved: true,
 	}}, nil
+}
+
+// request builds the first round's request from the cluster's evidence, with
+// the earlier tries at the failure (step.WithPreviousTries).
+func (p *Prompt) request(in step.PromptInput, target remediation.UpstreamTarget) prompt.ProposeRequest {
+	precedents, _ := remediation.Get[[]prompt.Precedent](in.Evidence, remediation.KeyFailurePrecedents)
+
+	f := in.Failure
+	members := make([]prompt.MemberFailure, 0, len(f.Members))
+	for _, n := range f.Members {
+		members = append(members, prompt.MemberFailure{NodeID: n.NodeID, Service: n.Service, ErrorExcerpt: p.sanitizer.Sanitize(n.ErrorExcerpt)})
+	}
+	return step.WithPreviousTries(prompt.AssembleUpstreamFix(prompt.UpstreamEvidence{
+		TargetNodeID:  target.NodeID,
+		TargetSource:  p.sanitizer.Sanitize(target.Source),
+		OwnChangeDiff: target.OwnChangeDiff,
+		Members:       members,
+		Precedents:    precedents,
+		CrossService:  f.Kind == workflow.ClusterCrossService,
+	}), in.Evidence)
 }
 
 // repoPath is where the ancestor's file lives in the repository.
