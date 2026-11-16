@@ -51,7 +51,11 @@ func (o *Observer) readLogs(ctx context.Context, d *model.Deployment) model.Atte
 			blockReason = model.ReasonFromResultBlock(r.Reason)
 		}
 	}
-	f := model.AttemptFacts{NothingToDo: strings.Contains(tail, nothingToDo), LogMessage: o.truncate(blockMessage), Reason: blockReason}
+	nodeType := pkgmodel.NodeType(d.Command().NodeType)
+	if d.Mode() != model.ModeProduction {
+		nodeType = pkgmodel.NodeType(d.ValidationCommand().NodeType)
+	}
+	f := model.AttemptFacts{NothingToDo: !nodeType.IsPython() && strings.Contains(tail, nothingToDo), LogMessage: o.truncate(blockMessage), Reason: blockReason}
 	if p := o.readSeedPreflight(ioCtx, d); p != nil {
 		f.SeedPreflight = p.findings
 		if p.reason != "" {
