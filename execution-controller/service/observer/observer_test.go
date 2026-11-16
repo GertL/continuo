@@ -389,3 +389,35 @@ func TestReadLogs_ASeedBuildWithoutAPreflightReadsNoPreflightLog(t *testing.T) {
 
 	assert.Nil(t, f.SeedPreflight)
 }
+
+// A Job found missing adds job_missing to its attempt only when nothing
+// recorded of the attempt explains how it ended: a deadline, a memory kill, an
+// eviction, an exit code or a stop request keeps its own outcome, and only an
+// attempt that would otherwise read as lost with its node becomes job_missing.
+func TestEndedFacts_AddsJobMissingOnlyWhenNothingRecordedExplainsTheEnd(t *testing.T) {
+	now := time.Now()
+	exitCode := int32(1)
+	for name, tc := range map[string]struct {
+		facts   model.AttemptFacts
+		want    pkgmodel.FailureReason
+		stopped bool
+	}{
+		"nothing recorded":     {want: pkgmodel.FailureReasonJobMissing},
+		"observed deadline":    {facts: model.AttemptFacts{JobFailureReason: "DeadlineExceeded"}, want: pkgmodel.FailureReasonDeadlineExceeded},
+		"observed memory kill": {facts: model.AttemptFacts{TerminationReason: "OOMKilled"}, want: pkgmodel.FailureReasonOOMKilled},
+		"observed eviction":    {facts: model.AttemptFacts{PodReason: "Evicted"}, want: pkgmodel.FailureReasonEvicted},
+		"observed exit code":   {facts: model.AttemptFacts{ExitCode: &exitCode}, want: pkgmodel.FailureReasonExitCode},
+		"requested stop":       {facts: model.AttemptFacts{StopRequestedAt: &now}, stopped: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := tc.facts
+			endedFacts(func(next model.AttemptFacts) { f, _ = f.Merge(next) }, func() model.AttemptFacts { return f },
+				model.JobObservation{}, model.JobObservation{}, model.AttemptFacts{},
+				model.AttemptFacts{Reason: pkgmodel.FailureReasonJobMissing}, now)
+
+			verdict := model.Classify(f)
+			assert.Equal(t, tc.want, verdict.Reason)
+			assert.Equal(t, tc.stopped, verdict.Stopped)
+		})
+	}
+}
