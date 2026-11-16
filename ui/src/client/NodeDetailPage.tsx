@@ -176,10 +176,16 @@ export default function NodeDetailPage() {
   }, [historyInFlight, fetchRuns]);
 
   useEffect(() => {
+    setTestCount(null);
+    setNodeType('');
+    setSourceUri('');
+    setInactive(false);
     if (!service || !schema || !table) return;
+    let current = true;
     fetch(`/api/nodes/${encodeURIComponent(service)}/${encodeURIComponent(schema)}/${encodeURIComponent(table)}/meta`)
       .then(r => (r.ok ? r.json() : null))
       .then((m: NodeMetaResponse | null) => {
+        if (!current) return;
         setTestCount(m && typeof m.test_count === 'number'
           ? { count: m.test_count, known: Boolean(m.test_count_known) }
           : null);
@@ -188,11 +194,13 @@ export default function NodeDetailPage() {
         setInactive(Boolean(m?.inactive));
       })
       .catch(() => {
+        if (!current) return;
         setTestCount(null);
         setNodeType('');
         setSourceUri('');
         setInactive(false);
       });
+    return () => { current = false; };
   }, [service, schema, table]);
 
   // The node's row of the node list: its task timeout and whether it is
