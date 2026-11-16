@@ -22,7 +22,8 @@ const nothingToDo = "Nothing to do"
 // check mode, the reason it stopped the load. The
 // dbt container's result is read only from the pod's main log, never from the
 // preflight's. It runs outside any transaction, under LogIOTimeout, and
-// soft-fails: a log that cannot be read or uploaded leaves its facts empty.
+// soft-fails: a log that cannot be read or uploaded leaves its own facts
+// empty, and the preflight's log is read even when the pod's log cannot be.
 func (o *Observer) readLogs(ctx context.Context, d *model.Deployment) model.AttemptFacts {
 	ioCtx, cancel := context.WithTimeout(ctx, o.cfg.LogIOTimeout)
 	defer cancel()

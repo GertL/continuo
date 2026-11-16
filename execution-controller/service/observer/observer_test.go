@@ -130,6 +130,23 @@ func TestReadLogs_ACheckThatFoundAnUnownedViewFailsTheAttemptUnownedDependents(t
 	assert.Equal(t, "bi.fx_rates_report", f.SeedPreflight.Outside()[0].Object())
 }
 
+// A pod log that cannot be read does not lose the preflight's refusal: the
+// preflight container's log is read on its own, so the attempt still fails
+// invalid unowned_dependents with its findings. No log key is kept, so the pod
+// log is read again on the attempt's next observation.
+func TestReadLogs_APreflightRefusalSurvivesAPodLogThatCannotBeRead(t *testing.T) {
+	block := preflightBlock("error", "unowned_dependents", `"checked":true,"dependents":[{"schema":"bi","name":"fx_rates_report","kind":"view","owner":"bi","depth":1,"allowed":false}]`)
+	o := observerWithLogs(t, &fakeLogs{podErr: errBoom, containers: map[string]string{model.SeedPreflightContainer: block}})
+
+	f := o.readLogs(context.Background(), seedDeployment(seedreload.PreflightCheck))
+
+	assert.Equal(t, pkgmodel.FailureReasonUnownedDependents, f.Reason)
+	assert.Equal(t, pkgmodel.FailureClassInvalid, f.Class())
+	require.NotNil(t, f.SeedPreflight)
+	assert.Equal(t, "bi.fx_rates_report", f.SeedPreflight.Outside()[0].Object())
+	assert.Empty(t, f.LogKey)
+}
+
 // The preflight's own log decides the reason: the pod's main log, which holds
 // nothing of it, is no part of it.
 func TestReadLogs_ACheckBlockOnlyInThePreflightLogStillDecidesTheReason(t *testing.T) {
