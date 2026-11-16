@@ -1519,12 +1519,13 @@ describe('NodeDetailPage — history of a run still in flight', () => {
 
   // Answers every read with the history `rows` holds at that moment, and
   // counts the history reads.
-  function serveHistory(rows: { current: ReturnType<typeof mkRun>[]; fail?: boolean }) {
+  function serveHistory(rows: { current: ReturnType<typeof mkRun>[]; fail?: boolean; httpStatus?: number }) {
     let reads = 0;
     mockFetch.mockImplementation((input: RequestInfo | URL) => {
       if (String(input).includes('/runs?')) {
         reads += 1;
         if (rows.fail) return Promise.reject(new Error('no answer'));
+        if (rows.httpStatus) return jsonResp({ error: 'run-controller unavailable' }, rows.httpStatus);
         return jsonResp({ tasks: rows.current });
       }
       return jsonResp({});
@@ -1576,6 +1577,30 @@ describe('NodeDetailPage — history of a run still in flight', () => {
     await nextPoll();
 
     expect(screen.getByText('running')).toBeInTheDocument();
+  });
+
+  it('keeps running rows after an HTTP error and recovers on the next poll', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const rows: { current: ReturnType<typeof mkRun>[]; httpStatus?: number } = {
+      current: [mkRun({ task_status: 'running' })],
+    };
+    const reads = serveHistory(rows);
+    renderPage();
+    await screen.findByText('running');
+
+    rows.httpStatus = 503;
+    await nextPoll();
+
+    expect(screen.getByText('running')).toBeInTheDocument();
+    expect(reads()).toBe(2);
+
+    rows.httpStatus = undefined;
+    rows.current = [mkRun({ task_status: 'succeeded' })];
+    await nextPoll();
+
+    expect(reads()).toBe(3);
+    expect(screen.getByText('succeeded')).toBeInTheDocument();
+    expect(screen.queryByText('running')).toBeNull();
   });
 });
 
