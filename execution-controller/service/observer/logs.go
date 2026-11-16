@@ -30,7 +30,6 @@ func (o *Observer) readLogs(ctx context.Context, d *model.Deployment) model.Atte
 	fullLog, tail, err := o.deps.Logs.GetPodLogs(ioCtx, d.JobName(), o.cfg.LogTailLines)
 	if err != nil {
 		o.deps.Logger.Warn("Failed to read the pod log", "job_name", d.JobName(), "error", err)
-		return model.AttemptFacts{}
 	}
 	// The result block, printed by validation pods and python-family
 	// containers, is cut out of the text log. The full log and the tail are
